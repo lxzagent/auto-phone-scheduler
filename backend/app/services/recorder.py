@@ -31,6 +31,7 @@ class RecorderService:
         self._ffmpeg: asyncio.subprocess.Process | None = None
         self._writer_task: asyncio.Task | None = None
         self._stopping = False
+        self._writer_error: str | None = None
 
     @staticmethod
     def _ffmpeg_path() -> str:
@@ -73,7 +74,7 @@ class RecorderService:
                 *command,
                 stdin=asyncio.subprocess.PIPE,
                 stdout=asyncio.subprocess.DEVNULL,
-                stderr=asyncio.subprocess.PIPE,
+                stderr=asyncio.subprocess.DEVNULL,
             )
         except Exception:
             await subscription.close()
@@ -89,6 +90,7 @@ class RecorderService:
         self._subscription = subscription
         self._ffmpeg = process
         self._stopping = False
+        self._writer_error = None
         self._writer_task = asyncio.create_task(
             self._write_stream(), name=f"record-{execution_id}-{self._device_serial}"
         )
@@ -113,10 +115,10 @@ class RecorderService:
                     await self._ffmpeg.stdin.drain()
         except asyncio.CancelledError:
             raise
-        except (BrokenPipeError, ConnectionResetError) as exc:
+        except Exception as exc:
             if not self._stopping:
-                logger.exception("[Recorder] FFmpeg 输入管道中断")
-                raise RuntimeError("FFmpeg 输入管道中断") from exc
+                self._writer_error = str(exc)
+                logger.exception("[Recorder] 视频流写入失败")
         finally:
             if self._ffmpeg and self._ffmpeg.stdin and not self._ffmpeg.stdin.is_closing():
                 self._ffmpeg.stdin.close()
@@ -147,20 +149,18 @@ class RecorderService:
             process.kill()
             await process.wait()
 
-        stderr = b""
-        if process.stderr:
-            stderr = await process.stderr.read()
-
         self._ffmpeg = None
         self._subscription = None
         self._writer_task = None
         self._current_file = None
 
         path = Path(output)
-        if process.returncode != 0:
-            logger.error("[Recorder] FFmpeg 退出码=%s stderr=%s", process.returncode, stderr.decode(errors="replace"))
+        if process.returncode != 0 or self._writer_error:
+            logger.error("[Recorder] 录制失败: ffmpeg_exit=%s writer_error=%s", process.returncode, self._writer_error)
             path.unlink(missing_ok=True)
+            self._writer_error = None
             return None
+        self._writer_error = None
         if not path.exists() or path.stat().st_size < 1024:
             logger.error("[Recorder] MP4 文件不存在或过小: %s", output)
             path.unlink(missing_ok=True)
