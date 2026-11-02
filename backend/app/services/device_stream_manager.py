@@ -96,7 +96,14 @@ class _DeviceStream:
             for subscriber in tuple(self.subscribers):
                 subscriber.queue.put_nowait(StreamMessage(error=str(exc)))
         finally:
+            self.stopped = True
+            self.streamer.stop()
             for subscriber in tuple(self.subscribers):
+                if subscriber.queue.full():
+                    try:
+                        subscriber.queue.get_nowait()
+                    except asyncio.QueueEmpty:
+                        pass
                 subscriber.queue.put_nowait(_END)
 
     async def stop(self) -> None:
