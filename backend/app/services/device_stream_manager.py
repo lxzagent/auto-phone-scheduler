@@ -142,7 +142,7 @@ class DeviceStreamManager:
     async def unsubscribe(self, subscription: DeviceStreamSubscription) -> None:
         async with self._lock:
             stream = self._streams.get(subscription.device_id)
-            if stream is None:
+            if stream is None or subscription not in stream.subscribers:
                 return
             stream.subscribers.discard(subscription)
             if subscription.queue.full():
