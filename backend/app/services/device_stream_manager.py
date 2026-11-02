@@ -138,6 +138,11 @@ class DeviceStreamManager:
             if stream is None:
                 return
             stream.subscribers.discard(subscription)
+            if subscription.queue.full():
+                try:
+                    subscription.queue.get_nowait()
+                except asyncio.QueueEmpty:
+                    pass
             subscription.queue.put_nowait(_END)
             if not stream.subscribers:
                 self._streams.pop(subscription.device_id, None)
