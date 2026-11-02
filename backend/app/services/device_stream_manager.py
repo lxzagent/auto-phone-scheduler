@@ -29,7 +29,8 @@ class DeviceStreamSubscription:
     def __init__(self, manager: "DeviceStreamManager", device_id: str):
         self.manager = manager
         self.device_id = device_id
-        self.queue: asyncio.Queue = asyncio.Queue()
+        self.queue: asyncio.Queue = asyncio.Queue(maxsize=256)
+        self.lossless = False
         self.closed = False
 
     async def __aiter__(self) -> AsyncIterator[StreamMessage]:
@@ -75,7 +76,18 @@ class _DeviceStream:
                 # Keep the pump independent from slow consumers. Recording subscribers
                 # are expected to drain continuously; queue metrics can be added later.
                 for subscriber in tuple(self.subscribers):
-                    if not subscriber.closed:
+                    if subscriber.closed:
+                        continue
+                    if subscriber.queue.full():
+                        if subscriber.lossless:
+                            await subscriber.queue.put(message)
+                        else:
+                            try:
+                                subscriber.queue.get_nowait()
+                            except asyncio.QueueEmpty:
+                                pass
+                            subscriber.queue.put_nowait(message)
+                    else:
                         subscriber.queue.put_nowait(message)
         except asyncio.CancelledError:
             raise
@@ -105,7 +117,8 @@ class DeviceStreamManager:
         self._lock = asyncio.Lock()
 
     async def subscribe(
-        self, device_id: str, max_size: int = 1280, bit_rate: int = 4_000_000
+        self, device_id: str, max_size: int = 1280, bit_rate: int = 4_000_000,
+        lossless: bool = False,
     ) -> tuple[DeviceStreamSubscription, ScrcpyVideoStreamMetadata]:
         async with self._lock:
             stream = self._streams.get(device_id)
@@ -114,6 +127,7 @@ class DeviceStreamManager:
                 self._streams[device_id] = stream
             await stream.start()
             subscription = DeviceStreamSubscription(self, device_id)
+            subscription.lossless = lossless
             stream.subscribers.add(subscription)
             subscription.queue.put_nowait(StreamMessage(metadata=stream.metadata))
             return subscription, stream.metadata
