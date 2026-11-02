@@ -28,9 +28,9 @@ async def get_device_resolution(device_id: str) -> tuple[int, int] | None:
     try:
         stdout, _ = await run_adb("shell", "wm", "size", serial=device_id)
         output = stdout.decode(errors="replace")
-        match = re.search(r"Physical size:\\s*(\\d+)x(\\d+)", output)
+        match = re.search(r"Physical size:\s*(\d+)x(\d+)", output)
         if not match:
-            match = re.search(r"(\\d+)x(\\d+)", output)
+            match = re.search(r"(\d+)x(\d+)", output)
         if match:
             return int(match.group(1)), int(match.group(2))
     except Exception as exc:
