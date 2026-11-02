@@ -7,6 +7,7 @@ from __future__ import annotations
 
 import asyncio
 import logging
+import socket
 import zlib
 from dataclasses import dataclass
 from typing import AsyncIterator
@@ -48,7 +49,19 @@ class DeviceStreamSubscription:
 
 class _DeviceStream:
     def __init__(self, device_id: str, max_size: int, bit_rate: int):
-        port = 28000 + (zlib.crc32(device_id.encode("utf-8")) % 20000)
+        seed = zlib.crc32(device_id.encode("utf-8")) % 20000
+        port = None
+        for offset in range(20000):
+            candidate = 28000 + ((seed + offset) % 20000)
+            with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as probe:
+                try:
+                    probe.bind(("127.0.0.1", candidate))
+                    port = candidate
+                    break
+                except OSError:
+                    continue
+        if port is None:
+            raise RuntimeError("没有可用的 Scrcpy 本地转发端口")
         self.streamer = ScrcpyStreamer(
             device_id=device_id,
             max_size=max_size,
