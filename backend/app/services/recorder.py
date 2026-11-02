@@ -57,7 +57,7 @@ class RecorderService:
         ffmpeg = self._ffmpeg_path()
 
         subscription, metadata = await device_stream_manager.subscribe(
-            self._device_serial, max_size=1280, bit_rate=6_000_000
+            self._device_serial, max_size=1280, bit_rate=6_000_000, lossless=True
         )
         if metadata.codec != 0x68323634:
             await subscription.close()
