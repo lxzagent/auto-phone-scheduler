@@ -28,10 +28,10 @@ class StreamMessage:
 
 
 class DeviceStreamSubscription:
-    def __init__(self, manager: "DeviceStreamManager", device_id: str):
+    def __init__(self, manager: "DeviceStreamManager", device_id: str, queue_capacity: int = 256):
         self.manager = manager
         self.device_id = device_id
-        self.queue: asyncio.Queue = asyncio.Queue(maxsize=256)
+        self.queue: asyncio.Queue = asyncio.Queue(maxsize=max(16, queue_capacity))
         self.lossless = False
         self.awaiting_keyframe = True
         self.closed = False
@@ -117,7 +117,25 @@ class _DeviceStream:
                                 subscriber.awaiting_keyframe = False
                         if subscriber.queue.full():
                             if subscriber.lossless:
-                                await subscriber.queue.put(message)
+                                # Never let one slow recorder block the shared Scrcpy
+                                # pump (and therefore live preview/other consumers).
+                                # Fail this recording explicitly instead of silently
+                                # dropping packets or stalling every subscriber.
+                                subscriber.closed = True
+                                self.subscribers.discard(subscriber)
+                                while not subscriber.queue.empty():
+                                    try:
+                                        subscriber.queue.get_nowait()
+                                    except asyncio.QueueEmpty:
+                                        break
+                                subscriber.queue.put_nowait(StreamMessage(
+                                    error="录像订阅队列溢出：消费者处理速度低于 Scrcpy 输入速度，已终止本次录像"
+                                ))
+                                subscriber.queue.put_nowait(_END)
+                                logger.error(
+                                    "[StreamManager] 录像订阅队列溢出并隔离: device=%s capacity=%d",
+                                    self.streamer.device_id, subscriber.queue.maxsize,
+                                )
                             else:
                                 try:
                                     subscriber.queue.get_nowait()
@@ -143,20 +161,19 @@ class _DeviceStream:
                 end_reason, end_error, len(self.subscribers),
             )
             for subscriber in tuple(self.subscribers):
-                # Never silently convert an unexpected source disconnect into a valid short recording.
                 if end_error and not subscriber.closed:
-                    if subscriber.queue.full():
+                    # Source failure invalidates a lossless recording. Surface the
+                    # error immediately rather than allowing a truncated MP4 to pass.
+                    while not subscriber.queue.empty():
                         try:
                             subscriber.queue.get_nowait()
                         except asyncio.QueueEmpty:
-                            pass
+                            break
                     subscriber.queue.put_nowait(StreamMessage(error=end_error))
-                if subscriber.queue.full():
-                    try:
-                        subscriber.queue.get_nowait()
-                    except asyncio.QueueEmpty:
-                        pass
-                subscriber.queue.put_nowait(_END)
+                    subscriber.queue.put_nowait(_END)
+                elif not subscriber.closed:
+                    # Normal end: preserve queued packets and let the consumer drain.
+                    await subscriber.queue.put(_END)
 
     async def stop(self) -> None:
         if self.stopped:
@@ -178,7 +195,7 @@ class DeviceStreamManager:
 
     async def subscribe(
         self, device_id: str, max_size: int = 1280, bit_rate: int = 4_000_000,
-        lossless: bool = False,
+        lossless: bool = False, queue_capacity: int = 256,
     ) -> tuple[DeviceStreamSubscription, ScrcpyVideoStreamMetadata]:
         async with self._lock:
             stream = self._streams.get(device_id)
@@ -189,7 +206,7 @@ class DeviceStreamManager:
             # emit its codec configuration immediately after metadata; starting the
             # pump first can consume that packet before the first subscriber exists,
             # leaving WebCodecs unable to decode any subsequent frames (black screen).
-            subscription = DeviceStreamSubscription(self, device_id)
+            subscription = DeviceStreamSubscription(self, device_id, queue_capacity=queue_capacity)
             subscription.lossless = lossless
             stream.subscribers.add(subscription)
             try:
@@ -208,20 +225,23 @@ class DeviceStreamManager:
             return subscription, stream.metadata
 
     async def unsubscribe(self, subscription: DeviceStreamSubscription) -> None:
+        stream_to_stop = None
         async with self._lock:
             stream = self._streams.get(subscription.device_id)
-            if stream is None or subscription not in stream.subscribers:
+            if stream is None:
                 return
-            stream.subscribers.discard(subscription)
-            if subscription.queue.full():
-                try:
-                    subscription.queue.get_nowait()
-                except asyncio.QueueEmpty:
-                    pass
-            subscription.queue.put_nowait(_END)
+            # Synchronize with the pump so no packet can be enqueued after _END.
+            async with stream.packet_lock:
+                stream.subscribers.discard(subscription)
             if not stream.subscribers:
                 self._streams.pop(subscription.device_id, None)
-                await stream.stop()
+                stream_to_stop = stream
+
+        # Do not discard the tail of a lossless recording just to insert _END.
+        # The writer is consuming concurrently and will drain the queue.
+        await subscription.queue.put(_END)
+        if stream_to_stop is not None:
+            await stream_to_stop.stop()
 
 
 device_stream_manager = DeviceStreamManager()
