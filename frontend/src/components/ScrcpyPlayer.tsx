@@ -178,6 +178,19 @@ export function ScrcpyPlayer({
     const socket = io(SOCKET_URL, { path: '/socket.io', transports: ['websocket', 'polling'], timeout: 10000 })
     socketRef.current = socket
 
+    // The backend may emit the first H.264 packets immediately after metadata.
+    // Buffer them while the asynchronous WebCodecs decoder is being initialized,
+    // otherwise the SPS/PPS configuration or first keyframe can be lost.
+    const earlyVideoPackets: VideoPacket[] = []
+    let videoDataHandler: ((data: VideoPacket) => Promise<void>) | null = null
+    socket.on('video-data', (data: VideoPacket) => {
+      if (videoDataHandler) {
+        void videoDataHandler(data)
+      } else {
+        earlyVideoPackets.push(data)
+      }
+    })
+
     socket.on('connect', () => {
       console.log('[ScrcpyPlayer] Socket 已连接, 请求设备:', deviceId)
       socket.emit('connect-device', { device_id: deviceId, maxSize: 1280, bitRate: 4_000_000 })
@@ -268,7 +281,10 @@ export function ScrcpyPlayer({
           }
         }
 
-        socket.on('video-data', handleVideoData)
+        videoDataHandler = handleVideoData
+        for (const packet of earlyVideoPackets.splice(0)) {
+          await handleVideoData(packet)
+        }
         setStatus('connected')
 
       } catch (error) {
