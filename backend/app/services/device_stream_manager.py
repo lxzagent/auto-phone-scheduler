@@ -8,6 +8,7 @@ from __future__ import annotations
 import asyncio
 import logging
 import socket
+import time
 import zlib
 from dataclasses import dataclass
 from typing import AsyncIterator
@@ -74,6 +75,7 @@ class _DeviceStream:
         self.pump_task: asyncio.Task | None = None
         self.start_lock = asyncio.Lock()
         self.stopped = False
+        self.stopping = False
         self.packet_lock = asyncio.Lock()
         self.configuration_packet: ScrcpyMediaStreamPacket | None = None
 
@@ -86,8 +88,17 @@ class _DeviceStream:
             self.pump_task = asyncio.create_task(self._pump(), name=f"scrcpy-pump-{self.streamer.device_id}")
 
     async def _pump(self) -> None:
+        started = time.monotonic()
+        packet_count = 0
+        data_packet_count = 0
+        end_reason = "stream_exhausted"
+        end_error: str | None = None
+        logger.info("[StreamManager] Scrcpy 数据泵启动: device=%s", self.streamer.device_id)
         try:
             async for packet in self.streamer.iter_packets():
+                packet_count += 1
+                if packet.type == "data":
+                    data_packet_count += 1
                 async with self.packet_lock:
                     if packet.type == "configuration":
                         # Cache SPS/PPS so a browser that reconnects to an already
@@ -116,15 +127,30 @@ class _DeviceStream:
                         else:
                             subscriber.queue.put_nowait(message)
         except asyncio.CancelledError:
+            end_reason = "cancelled"
             raise
         except Exception as exc:
-            logger.exception("Scrcpy stream failed for %s", self.streamer.device_id)
-            for subscriber in tuple(self.subscribers):
-                subscriber.queue.put_nowait(StreamMessage(error=str(exc)))
+            end_reason = "error"
+            end_error = str(exc)
+            logger.exception("[StreamManager] Scrcpy 数据泵异常: device=%s", self.streamer.device_id)
         finally:
+            elapsed = time.monotonic() - started
             self.stopped = True
             self.streamer.stop()
+            logger.warning(
+                "[StreamManager] Scrcpy 数据泵结束: device=%s packets=%d data_packets=%d elapsed_s=%.3f reason=%s error=%s subscribers=%d",
+                self.streamer.device_id, packet_count, data_packet_count, elapsed,
+                end_reason, end_error, len(self.subscribers),
+            )
             for subscriber in tuple(self.subscribers):
+                # Never silently convert an unexpected source disconnect into a valid short recording.
+                if end_error and not subscriber.closed:
+                    if subscriber.queue.full():
+                        try:
+                            subscriber.queue.get_nowait()
+                        except asyncio.QueueEmpty:
+                            pass
+                    subscriber.queue.put_nowait(StreamMessage(error=end_error))
                 if subscriber.queue.full():
                     try:
                         subscriber.queue.get_nowait()
@@ -135,6 +161,7 @@ class _DeviceStream:
     async def stop(self) -> None:
         if self.stopped:
             return
+        self.stopping = True
         self.stopped = True
         if self.pump_task and not self.pump_task.done():
             self.pump_task.cancel()
