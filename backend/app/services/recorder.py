@@ -5,6 +5,7 @@ import asyncio
 import logging
 import os
 import shutil
+import time
 from datetime import datetime
 from pathlib import Path
 
@@ -35,6 +36,8 @@ class RecorderService:
         self._writer_task: asyncio.Task | None = None
         self._stopping = False
         self._writer_error: str | None = None
+        self._stderr_task: asyncio.Task | None = None
+        self._started_monotonic: float | None = None
 
     @staticmethod
     def _ffmpeg_path() -> str:
@@ -82,7 +85,7 @@ class RecorderService:
                 *command,
                 stdin=asyncio.subprocess.PIPE,
                 stdout=asyncio.subprocess.DEVNULL,
-                stderr=asyncio.subprocess.DEVNULL,
+                stderr=asyncio.subprocess.PIPE,
             )
         except Exception:
             await subscription.close()
@@ -99,6 +102,10 @@ class RecorderService:
         self._ffmpeg = process
         self._stopping = False
         self._writer_error = None
+        self._started_monotonic = time.monotonic()
+        self._stderr_task = asyncio.create_task(
+            self._drain_ffmpeg_stderr(process), name=f\"ffmpeg-stderr-{execution_id}-{self._device_serial}\"
+        )
         self._writer_task = asyncio.create_task(
             self._write_stream(), name=f"record-{execution_id}-{self._device_serial}"
         )
@@ -108,10 +115,30 @@ class RecorderService:
         )
         return str(output)
 
+    async def _drain_ffmpeg_stderr(self, process: asyncio.subprocess.Process) -> None:
+        """Drain FFmpeg stderr continuously to prevent a full pipe from blocking FFmpeg."""
+        if process.stderr is None:
+            return
+        tail = bytearray()
+        try:
+            while chunk := await process.stderr.read(4096):
+                tail.extend(chunk)
+                if len(tail) > 16_384:
+                    del tail[:-16_384]
+        except asyncio.CancelledError:
+            raise
+        finally:
+            if tail:
+                logger.warning("[Recorder] FFmpeg stderr: device=%s detail=%s", self._device_serial,
+                               tail.decode("utf-8", errors="replace").strip())
+
     async def _write_stream(self) -> None:
         assert self._subscription is not None
         assert self._ffmpeg is not None and self._ffmpeg.stdin is not None
         packet_count = 0
+        started = time.monotonic()
+        last_packet_at = started
+        max_inter_packet_gap = 0.0
         first_scrcpy_pts: int | None = None
         last_scrcpy_pts: int | None = None
         try:
@@ -123,6 +150,9 @@ class RecorderService:
                     continue
                 if packet.data:
                     if packet.type == "data":
+                        now = time.monotonic()
+                        max_inter_packet_gap = max(max_inter_packet_gap, now - last_packet_at)
+                        last_packet_at = now
                         packet_count += 1
                         if packet.pts is not None:
                             if first_scrcpy_pts is None:
@@ -145,8 +175,9 @@ class RecorderService:
                 else None
             )
             logger.info(
-                "[Recorder] 输入流结束: device=%s packets=%d scrcpy_pts_span_s=%s",
-                self._device_serial, packet_count, pts_span,
+                "[Recorder] 输入流结束: device=%s packets=%d wall_elapsed_s=%.3f scrcpy_pts_span_s=%s max_packet_gap_s=%.3f stopping=%s",
+                self._device_serial, packet_count, time.monotonic() - started, pts_span,
+                max_inter_packet_gap, self._stopping,
             )
 
     async def stop_recording(self) -> str | None:
@@ -159,6 +190,7 @@ class RecorderService:
         process = self._ffmpeg
         subscription = self._subscription
         writer = self._writer_task
+        stop_started = time.monotonic()
 
         if subscription:
             await subscription.close()
@@ -169,6 +201,9 @@ class RecorderService:
                 writer.cancel()
                 await asyncio.gather(writer, return_exceptions=True)
 
+        if self._stderr_task:
+            await asyncio.gather(self._stderr_task, return_exceptions=True)
+
         try:
             await asyncio.wait_for(process.wait(), timeout=20)
         except asyncio.TimeoutError:
@@ -178,6 +213,7 @@ class RecorderService:
         self._ffmpeg = None
         self._subscription = None
         self._writer_task = None
+        self._stderr_task = None
         self._current_file = None
 
         path = Path(output)
@@ -192,7 +228,11 @@ class RecorderService:
             path.unlink(missing_ok=True)
             return None
 
-        logger.info("[Recorder] MP4 录制完成: %s (%s bytes)", output, path.stat().st_size)
+        elapsed = time.monotonic() - self._started_monotonic if self._started_monotonic else 0.0
+        logger.info("[Recorder] MP4 录制完成: device=%s elapsed_s=%.3f ffmpeg_exit=%s file=%s bytes=%s stop_wait_s=%.3f",
+                    self._device_serial, elapsed, process.returncode, output, path.stat().st_size,
+                    time.monotonic() - stop_started)
+        self._started_monotonic = None
         return output
 
     async def get_recording_path(self, execution_id: int) -> str | None:
