@@ -120,21 +120,14 @@ class ScrcpyStreamer:
             return -1, "", str(e)
 
     async def _cleanup_existing_server(self) -> None:
-        """清理已有的 scrcpy 进程（快速版本）"""
-        print("[scrcpy] 清理: 快速清理...", flush=True)
+        """仅清理本实例端口转发，不杀死设备上的其他 app_process。
 
-        # 并行执行清理操作，使用非常短的超时
-        async def kill_process():
-            cmd = self._adb_cmd("shell", "pkill -9 app_process 2>/dev/null; exit 0")
-            await self._run_cmd(cmd, timeout=2)
-
-        async def remove_forward():
-            cmd = self._adb_cmd("forward", "--remove", f"tcp:{self.port}")
-            await self._run_cmd(cmd, timeout=1)
-
-        # 并行执行，不等待结果
-        await asyncio.gather(kill_process(), remove_forward(), return_exceptions=True)
-        print("[scrcpy] 清理: 完成", flush=True)
+        旧实现 pkill -9 app_process 会误杀同一设备上的其他 Scrcpy 会话
+        或依赖 app_process 的服务。设备服务的生命周期由共享流管理器负责。
+        """
+        logger.info("[scrcpy] 清理本实例端口转发: %s", self.port)
+        cmd = self._adb_cmd("forward", "--remove", f"tcp:{self.port}")
+        await self._run_cmd(cmd, timeout=2)
 
     async def _push_server(self) -> None:
         """推送 scrcpy-server 到设备"""
