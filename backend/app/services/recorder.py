@@ -62,7 +62,7 @@ class RecorderService:
 
         timestamp = datetime.now().strftime("%Y%m%d_%H%M%S_%f")
         output = self.recordings_dir / f"exec_{execution_id}_{timestamp}.mp4"
-        ffmpeg = self._ffmpeg_path()
+        ffmpeg = self._ffmpeg_path() if self._backend == "ffmpeg" else None
 
         if self._backend not in {"ffmpeg", "pyav"}:
             raise RuntimeError("RECORDING_BACKEND 仅支持 ffmpeg 或 pyav")
@@ -100,6 +100,7 @@ class RecorderService:
                     await process.wait()
                     raise RuntimeError("FFmpeg stdin 初始化失败")
             else:
+                import av  # noqa: F401 - fail fast before the Scrcpy session starts
                 from app.services.pyav_recorder import PyAVRecorder
                 pyav_recorder = PyAVRecorder(output)
                 pyav_recorder.start()
@@ -206,7 +207,7 @@ class RecorderService:
             )
 
     async def stop_recording(self) -> str | None:
-        if not self._ffmpeg or not self._current_file:
+        if (self._ffmpeg is None and self._pyav_recorder is None) or not self._current_file:
             logger.warning("[Recorder] 没有正在进行的录制")
             return None
 
