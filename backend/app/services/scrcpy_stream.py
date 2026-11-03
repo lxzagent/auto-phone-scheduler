@@ -49,6 +49,7 @@ class ScrcpyStreamer:
         self._metadata: Optional[ScrcpyVideoStreamMetadata] = None
         self._dummy_byte_skipped = False
         self._running = False
+        self.last_stream_error: str | None = None
 
         self.scrcpy_server_path, self.scrcpy_version = self._find_scrcpy_server()
 
@@ -354,15 +355,21 @@ class ScrcpyStreamer:
         )
 
     async def iter_packets(self) -> AsyncIterator[ScrcpyMediaStreamPacket]:
-        """持续生成数据包"""
+        """持续生成数据包；非主动停止时将断流作为异常上抛。"""
         while self._running:
             try:
                 yield await self.read_media_packet()
-            except ConnectionError:
-                break
-            except Exception as e:
-                logger.error(f"读取数据包失败: {e}")
-                break
+            except asyncio.CancelledError:
+                raise
+            except Exception as exc:
+                if self._running:
+                    self.last_stream_error = str(exc)
+                    logger.exception(
+                        "[scrcpy] 视频流读取中断: device=%s port=%s error=%s",
+                        self.device_id, self.port, exc,
+                    )
+                    raise ConnectionError(f"Scrcpy 视频流中断: {exc}") from exc
+                return
 
     def stop(self) -> None:
         """停止 scrcpy 服务器并清理资源"""
