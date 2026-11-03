@@ -145,10 +145,20 @@ class DeviceStreamManager:
             if stream is None or stream.stopped:
                 stream = _DeviceStream(device_id, max_size, bit_rate)
                 self._streams[device_id] = stream
-            await stream.start()
+            # Register the subscriber before starting the packet pump. Scrcpy may
+            # emit its codec configuration immediately after metadata; starting the
+            # pump first can consume that packet before the first subscriber exists,
+            # leaving WebCodecs unable to decode any subsequent frames (black screen).
             subscription = DeviceStreamSubscription(self, device_id)
             subscription.lossless = lossless
             stream.subscribers.add(subscription)
+            try:
+                await stream.start()
+            except Exception:
+                stream.subscribers.discard(subscription)
+                if not stream.subscribers:
+                    self._streams.pop(device_id, None)
+                raise
             subscription.queue.put_nowait(StreamMessage(metadata=stream.metadata))
             return subscription, stream.metadata
 
