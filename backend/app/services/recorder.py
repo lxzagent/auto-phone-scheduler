@@ -14,6 +14,9 @@ from app.services.device_stream_manager import device_stream_manager
 logger = logging.getLogger(__name__)
 settings = get_settings()
 
+# Keep synchronized with ScrcpyServerOptions.max_fps.
+RECORDING_FPS = 20
+
 
 class RecorderService:
     """Record a device's shared Scrcpy stream directly to a local MP4.
@@ -65,8 +68,13 @@ class RecorderService:
 
         command = [
             ffmpeg, "-hide_banner", "-loglevel", "warning", "-y",
-            "-f", "h264", "-framerate", "20", "-i", "pipe:0",
-            "-an", "-c:v", "copy", "-movflags", "+faststart",
+            "-f", "h264", "-framerate", str(RECORDING_FPS), "-i", "pipe:0",
+            "-an", "-c:v", "copy",
+            # FFmpeg's raw H.264 parser produced 1-us packet durations after
+            # ~2.5 s on this Scrcpy stream. Rebuild a monotonic 20-fps timeline.
+            "-bsf:v",
+            f"setts=pts=N/({RECORDING_FPS}*TB):dts=N/({RECORDING_FPS}*TB):duration=1/({RECORDING_FPS}*TB)",
+            "-movflags", "+faststart",
             "-f", "mp4", str(output),
         ]
         try:
@@ -103,6 +111,9 @@ class RecorderService:
     async def _write_stream(self) -> None:
         assert self._subscription is not None
         assert self._ffmpeg is not None and self._ffmpeg.stdin is not None
+        packet_count = 0
+        first_scrcpy_pts: int | None = None
+        last_scrcpy_pts: int | None = None
         try:
             async for message in self._subscription:
                 if message.error:
@@ -111,6 +122,12 @@ class RecorderService:
                 if packet is None or packet.type not in ("configuration", "data"):
                     continue
                 if packet.data:
+                    if packet.type == "data":
+                        packet_count += 1
+                        if packet.pts is not None:
+                            if first_scrcpy_pts is None:
+                                first_scrcpy_pts = packet.pts
+                            last_scrcpy_pts = packet.pts
                     self._ffmpeg.stdin.write(packet.data)
                     await self._ffmpeg.stdin.drain()
         except asyncio.CancelledError:
@@ -122,6 +139,15 @@ class RecorderService:
         finally:
             if self._ffmpeg and self._ffmpeg.stdin and not self._ffmpeg.stdin.is_closing():
                 self._ffmpeg.stdin.close()
+            pts_span = (
+                (last_scrcpy_pts - first_scrcpy_pts) / 1_000_000
+                if first_scrcpy_pts is not None and last_scrcpy_pts is not None
+                else None
+            )
+            logger.info(
+                "[Recorder] 输入流结束: device=%s packets=%d scrcpy_pts_span_s=%s",
+                self._device_serial, packet_count, pts_span,
+            )
 
     async def stop_recording(self) -> str | None:
         if not self._ffmpeg or not self._current_file:
