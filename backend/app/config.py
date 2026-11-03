@@ -22,6 +22,14 @@ class Settings(BaseSettings):
     # Recordings
     recordings_dir: str = "./recordings"
 
+    # MediaMTX / FFmpeg live video publishing (same-host Windows deployment)
+    mediamtx_enabled: bool = False
+    mediamtx_path: str = "./tools/mediamtx/mediamtx.exe"
+    mediamtx_config: str = "./config/mediamtx.yml"
+    mediamtx_rtsp_url: str = "rtsp://127.0.0.1:8554"
+    mediamtx_webrtc_url: str = "http://127.0.0.1:8889"
+    ffmpeg_path: str = ""
+
     # Notifications
     dingtalk_webhook: str = ""
     dingtalk_secret: str = ""
