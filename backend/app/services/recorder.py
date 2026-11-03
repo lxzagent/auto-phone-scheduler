@@ -104,7 +104,7 @@ class RecorderService:
         self._writer_error = None
         self._started_monotonic = time.monotonic()
         self._stderr_task = asyncio.create_task(
-            self._drain_ffmpeg_stderr(process), name=f\"ffmpeg-stderr-{execution_id}-{self._device_serial}\"
+            self._drain_ffmpeg_stderr(process), name=f"ffmpeg-stderr-{execution_id}-{self._device_serial}"
         )
         self._writer_task = asyncio.create_task(
             self._write_stream(), name=f"record-{execution_id}-{self._device_serial}"
