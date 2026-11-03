@@ -35,6 +35,7 @@ class DeviceStreamSubscription:
         self.lossless = False
         self.awaiting_keyframe = True
         self.closed = False
+        self._unsubscribed = False
 
     async def __aiter__(self) -> AsyncIterator[StreamMessage]:
         while True:
@@ -44,8 +45,11 @@ class DeviceStreamSubscription:
             yield item
 
     async def close(self) -> None:
-        if not self.closed:
-            self.closed = True
+        # A subscriber can be marked closed by the pump on queue overflow.
+        # Still run manager cleanup exactly once when its consumer closes.
+        self.closed = True
+        if not self._unsubscribed:
+            self._unsubscribed = True
             await self.manager.unsubscribe(self)
 
 
