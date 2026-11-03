@@ -32,6 +32,7 @@ class DeviceStreamSubscription:
         self.device_id = device_id
         self.queue: asyncio.Queue = asyncio.Queue(maxsize=256)
         self.lossless = False
+        self.awaiting_keyframe = True
         self.closed = False
 
     async def __aiter__(self) -> AsyncIterator[StreamMessage]:
@@ -73,6 +74,8 @@ class _DeviceStream:
         self.pump_task: asyncio.Task | None = None
         self.start_lock = asyncio.Lock()
         self.stopped = False
+        self.packet_lock = asyncio.Lock()
+        self.configuration_packet: ScrcpyMediaStreamPacket | None = None
 
     async def start(self) -> None:
         async with self.start_lock:
@@ -85,23 +88,33 @@ class _DeviceStream:
     async def _pump(self) -> None:
         try:
             async for packet in self.streamer.iter_packets():
-                message = StreamMessage(packet=packet)
-                # Keep the pump independent from slow consumers. Recording subscribers
-                # are expected to drain continuously; queue metrics can be added later.
-                for subscriber in tuple(self.subscribers):
-                    if subscriber.closed:
-                        continue
-                    if subscriber.queue.full():
-                        if subscriber.lossless:
-                            await subscriber.queue.put(message)
+                async with self.packet_lock:
+                    if packet.type == "configuration":
+                        # Cache SPS/PPS so a browser that reconnects to an already
+                        # running device stream can initialize a fresh WebCodecs decoder.
+                        self.configuration_packet = packet
+                    message = StreamMessage(packet=packet)
+                    for subscriber in tuple(self.subscribers):
+                        if subscriber.closed:
+                            continue
+                        if packet.type == "data":
+                            # A newly attached decoder cannot decode inter frames until
+                            # it receives an IDR/keyframe from the current stream.
+                            if subscriber.awaiting_keyframe and not packet.keyframe:
+                                continue
+                            if packet.keyframe:
+                                subscriber.awaiting_keyframe = False
+                        if subscriber.queue.full():
+                            if subscriber.lossless:
+                                await subscriber.queue.put(message)
+                            else:
+                                try:
+                                    subscriber.queue.get_nowait()
+                                except asyncio.QueueEmpty:
+                                    pass
+                                subscriber.queue.put_nowait(message)
                         else:
-                            try:
-                                subscriber.queue.get_nowait()
-                            except asyncio.QueueEmpty:
-                                pass
                             subscriber.queue.put_nowait(message)
-                    else:
-                        subscriber.queue.put_nowait(message)
         except asyncio.CancelledError:
             raise
         except Exception as exc:
@@ -154,12 +167,17 @@ class DeviceStreamManager:
             stream.subscribers.add(subscription)
             try:
                 await stream.start()
+                async with stream.packet_lock:
+                    subscription.queue.put_nowait(StreamMessage(metadata=stream.metadata))
+                    if stream.configuration_packet is not None:
+                        subscription.queue.put_nowait(
+                            StreamMessage(packet=stream.configuration_packet)
+                        )
             except Exception:
                 stream.subscribers.discard(subscription)
                 if not stream.subscribers:
                     self._streams.pop(device_id, None)
                 raise
-            subscription.queue.put_nowait(StreamMessage(metadata=stream.metadata))
             return subscription, stream.metadata
 
     async def unsubscribe(self, subscription: DeviceStreamSubscription) -> None:
