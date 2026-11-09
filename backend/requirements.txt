@@ -11,3 +11,4 @@ aiofiles==23.2.1
 python-socketio==5.11.0
 zeroconf==0.136.2
 phone-agent @ git+https://github.com/zai-org/Open-AutoGLM.git
+av==16.1.0

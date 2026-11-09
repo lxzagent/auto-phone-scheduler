@@ -1,0 +1,15 @@
+# Local Windows deployment: Python backend and MediaMTX on the same host.
+logLevel: info
+logDestinations: [stdout]
+rtsp: yes
+rtspAddress: 127.0.0.1:8554
+webrtc: yes
+webrtcAddress: 127.0.0.1:8889
+webrtcLocalUDPAddress: 127.0.0.1:8189
+hls: yes
+hlsAddress: 127.0.0.1:8888
+# For remote LAN browsers, add the backend PC LAN IP here and bind
+# WebRTC media on a reachable interface; open 8889/TCP and 8189/UDP.
+webrtcAdditionalHosts: []
+paths:
+  all:

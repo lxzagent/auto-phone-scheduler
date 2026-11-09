@@ -49,6 +49,7 @@ class ScrcpyStreamer:
         self._metadata: Optional[ScrcpyVideoStreamMetadata] = None
         self._dummy_byte_skipped = False
         self._running = False
+        self.last_stream_error: str | None = None
 
         self.scrcpy_server_path, self.scrcpy_version = self._find_scrcpy_server()
 
@@ -120,21 +121,14 @@ class ScrcpyStreamer:
             return -1, "", str(e)
 
     async def _cleanup_existing_server(self) -> None:
-        """清理已有的 scrcpy 进程（快速版本）"""
-        print("[scrcpy] 清理: 快速清理...", flush=True)
+        """仅清理本实例端口转发，不杀死设备上的其他 app_process。
 
-        # 并行执行清理操作，使用非常短的超时
-        async def kill_process():
-            cmd = self._adb_cmd("shell", "pkill -9 app_process 2>/dev/null; exit 0")
-            await self._run_cmd(cmd, timeout=2)
-
-        async def remove_forward():
-            cmd = self._adb_cmd("forward", "--remove", f"tcp:{self.port}")
-            await self._run_cmd(cmd, timeout=1)
-
-        # 并行执行，不等待结果
-        await asyncio.gather(kill_process(), remove_forward(), return_exceptions=True)
-        print("[scrcpy] 清理: 完成", flush=True)
+        旧实现 pkill -9 app_process 会误杀同一设备上的其他 Scrcpy 会话
+        或依赖 app_process 的服务。设备服务的生命周期由共享流管理器负责。
+        """
+        logger.info("[scrcpy] 清理本实例端口转发: %s", self.port)
+        cmd = self._adb_cmd("forward", "--remove", f"tcp:{self.port}")
+        await self._run_cmd(cmd, timeout=2)
 
     async def _push_server(self) -> None:
         """推送 scrcpy-server 到设备"""
@@ -361,15 +355,21 @@ class ScrcpyStreamer:
         )
 
     async def iter_packets(self) -> AsyncIterator[ScrcpyMediaStreamPacket]:
-        """持续生成数据包"""
+        """持续生成数据包；非主动停止时将断流作为异常上抛。"""
         while self._running:
             try:
                 yield await self.read_media_packet()
-            except ConnectionError:
-                break
-            except Exception as e:
-                logger.error(f"读取数据包失败: {e}")
-                break
+            except asyncio.CancelledError:
+                raise
+            except Exception as exc:
+                if self._running:
+                    self.last_stream_error = str(exc)
+                    logger.exception(
+                        "[scrcpy] 视频流读取中断: device=%s port=%s error=%s",
+                        self.device_id, self.port, exc,
+                    )
+                    raise ConnectionError(f"Scrcpy 视频流中断: {exc}") from exc
+                return
 
     def stop(self) -> None:
         """停止 scrcpy 服务器并清理资源"""
